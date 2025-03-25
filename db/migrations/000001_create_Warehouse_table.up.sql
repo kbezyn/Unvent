@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS Warehouse
 (
-    ID      INT PRIMARY KEY,    
+    ID      SERIAL PRIMARY KEY,    
     address VARCHAR (300) NOT NULL
 );

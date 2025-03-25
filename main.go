@@ -36,6 +36,7 @@ type Products struct {
 	Barcode     string                 `json:"barcode"`
 }
 type Inventory struct {
+	ID          int
 	ProductID   int     // ID товара
 	WarehouseID int     // ID склада
 	Quantity    int     // Количество товара на складе
@@ -44,19 +45,24 @@ type Inventory struct {
 }
 
 type Analytics struct {
-	WarehouseID int     `json:"warehouse_id"`
-	ProductID   int     `json:"product_id"`
-	Quantity    int     `json:"quantity"`
-	TotalAmount float64 `json:"total_amount"`
+	ProductName string  `json:"product_name"`
+	TotalSold   int     `json:"total_sold"`
+	TotalSum    float64 `json:"total_sum"`
 }
 
-var dbpool *pgxpool.Pool         // Объявляем dbpool как глобальную переменную
-var logger *zap.Logger           // Объявляем logger как глобальную переменную
-var products map[string]Products // products хранит товары
+type WarehouseRevenue struct {
+	WarehouseID  int     `json:"warehouse_id"`
+	Address      string  `json:"address"`
+	TotalRevenue float64 `json:"total_revenue"`
+}
+
+var dbpool *pgxpool.Pool
+var logger *zap.Logger
+var products map[string]Products
 var router *mux.Router
 
 func main() {
-	// Инициализация логгера
+	// Конфигурация энкодера для JSON формата.
 	logger, _ = zap.NewProduction()
 	defer logger.Sync()
 
@@ -69,31 +75,30 @@ func main() {
 	}
 	defer dbpool.Close()
 
-	// m, err := migrate.New(
-	// 	"file://db/migrations",
-	// 	"cockroachdb://cockroach:@localhost:26257/example?sslmode=disable")
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// if err := m.Up(); err != nil {
-	// 	log.Fatal(err)
-	// }
-
 	products = make(map[string]Products)
 	router := mux.NewRouter()
 	// Маршруты
-	http.HandleFunc("/warehouses", listWarehouses(dbpool, logger))
-	http.HandleFunc("/warehouses/create", createWarehouse(dbpool, logger))
-	http.HandleFunc("/products", getProductsHandler)
-	http.HandleFunc("/products/create", createProductHandler)
-	router.HandleFunc("/products/update/{id}", updateProductHandler).Methods("PUT")
-	http.HandleFunc("/products/update/{id}", updateProductHandler) // Endpoint обновления
-	// Пример HTTP-handler для покупки товара
-	http.HandleFunc("/buy", recordAnalytics)
+	router.HandleFunc("/warehouses", listWarehouses(dbpool, logger))
+	router.HandleFunc("/warehouses/create", createWarehouseHandler).Methods("POST")
+	router.HandleFunc("/products", getProductsHandler)
+	router.HandleFunc("/products/create", createProductHandler)
+	router.HandleFunc("/products/update/{id:[0-9]+}", updateProductHandler).Methods("PUT")
+	router.HandleFunc("/inventory/create", createInventory).Methods("POST")
+	router.HandleFunc("/inventory/{id:[0-9]+}", updateInventory).Methods("PUT")
+	router.HandleFunc("/inventory/discount", createDiscount).Methods("POST")
+	router.HandleFunc("/inventory/warehouse/{warehouse:[0-9]+}", getInventoryByWarehouse).Methods("GET")
+	router.HandleFunc("/inventory/{id:[0-9]+}", getInventoryItem).Methods("GET")
+	router.HandleFunc("/inventory/summary", getInventorySummary).Methods("POST")
+	router.HandleFunc("/inventory/purchase", purchaseItems).Methods("POST")
+	router.HandleFunc("/analytics", updateAnalytics).Methods("PUT")
+	router.HandleFunc("/analytics/warehouse/{warehouse_id}", getAnalyticsByWarehouse).Methods("GET")
+	router.HandleFunc("/top-warehouses", getTopWarehouses).Methods("GET")
+	http.Handle("/", router)
 
 	// Запуск сервера
 	fmt.Println("Сервер прослушивает порт 8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
+	logger.Sync()
 }
 
 // Основные функции
@@ -129,23 +134,40 @@ func listWarehouses(dbpool *pgxpool.Pool, logger *zap.Logger) http.HandlerFunc {
 	}
 }
 
-func createWarehouse(dbpool *pgxpool.Pool, logger *zap.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			address := r.FormValue("address")
-
-			_, err := dbpool.Exec(context.Background(), "INSERT INTO warehouses (address) VALUES ($1)", address)
-			if err != nil {
-				logger.Error("Failed to insert warehouse", zap.Error(err))
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-				return
-			}
-
-			fmt.Fprintln(w, "Склад успешно создан")
-		} else {
-			http.Error(w, "Метод, который не разрешен", http.StatusMethodNotAllowed)
-		}
+func createWarehouseHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Метод не разрешен", http.StatusMethodNotAllowed)
+		return
 	}
+
+	var warehouse Warehouse
+	if err := json.NewDecoder(r.Body).Decode(&warehouse); err != nil {
+		http.Error(w, "Неверный запрос", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем, заполнен ли адрес
+	if warehouse.Address == "" {
+		http.Error(w, "Адрес склада обязателен", http.StatusBadRequest)
+		return
+	}
+
+	// Сохраняем склад в базе данных
+	err := createWarehouseInDB(dbpool, warehouse.Address)
+	if err != nil {
+		logger.Error("Не удалось вставить склад", zap.Error(err))
+		http.Error(w, "Внутренняя ошибка сервера", http.StatusInternalServerError)
+		return
+	}
+
+	// Успешный ответ
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(warehouse)
+}
+
+func createWarehouseInDB(dbpool *pgxpool.Pool, address string) error {
+	_, err := dbpool.Exec(context.Background(), "INSERT INTO warehouses (address) VALUES ($1)", address)
+	return err
 }
 
 // PRODUCT
@@ -282,236 +304,213 @@ func createProduct(p Products) (int, error) {
 }
 
 // updateProduct обновляет существующий товар в БД
-func updateProduct(p Products) error {
-	featuresJSON, err := json.Marshal(p.Features)
-	if err != nil {
-		return fmt.Errorf("failed to marshal features: %w", err)
-	}
-
-	_, err = dbpool.Exec(context.Background(), `
-        UPDATE products
-        SET description = $1, features = $2
-        WHERE id = $3
-    `, p.Description, featuresJSON, p.ID)
-
-	if err != nil {
-		return fmt.Errorf("failed to update product: %w", err)
-	}
-
-	return nil
-}
-
-// ANALITICS
-func recordAnalytics(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Разрешен только метод POST", http.StatusMethodNotAllowed)
+func updateProduct(w http.ResponseWriter, r *http.Request) {
+	var p Products
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
 
-	var analytics Analytics
-	err := json.NewDecoder(r.Body).Decode(&analytics)
+	_, err := dbpool.Exec(context.Background(), "UPDATE products SET description = $1, attributes = $2 WHERE id = $3",
+		p.Description, p.Features, p.ID)
 	if err != nil {
+		logger.Error("Update failed", zap.Error(err))
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+}
+
+// ANALITICS
+func updateAnalytics(w http.ResponseWriter, r *http.Request) {
+	var sale Inventory
+	if err := json.NewDecoder(r.Body).Decode(&sale); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	_, err = dbpool.Exec(context.Background(),
-		"INSERT INTO analytics (warehouse_id, product_id, quantity, total_amount) VALUES ($1, $2, $3, $4)",
-		analytics.WarehouseID, analytics.ProductID, analytics.Quantity, analytics.TotalAmount)
-
+	_, err := dbpool.Exec(context.Background(), "INSERT INTO analytics (warehouse_id, product_id, quantity, total_amount) VALUES ($1, $2, $3, $4)",
+		sale.WarehouseID, sale.ProductID, sale.Quantity, sale.Discount)
 	if err != nil {
-		logger.Error("Не удалось вставить аналитику", zap.Error(err))
-		http.Error(w, "Не удалось записать аналитику", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	w.WriteHeader(http.StatusCreated)
-	fmt.Fprintln(w, "Аналитика успешно записана")
+	w.WriteHeader(http.StatusNoContent)
 }
 
-// package main
+func getAnalyticsByWarehouse(w http.ResponseWriter, r *http.Request) {
+	warehouseID := mux.Vars(r)["warehouse_id"]
+	rows, err := dbpool.Query(context.Background(), "SELECT p.name, SUM(a.quantity), SUM(a.total_amount) FROM analytics a JOIN products p ON a.product_id = p.id WHERE a.warehouse_id = $1 GROUP BY p.name", warehouseID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
 
-// import (
-// 	"context"
-// 	"encoding/json"
-// 	"fmt"
-// 	"log"
-// 	"net/http"
-// 	"strconv"
+	var analytics []Analytics
+	for rows.Next() {
+		var a Analytics
+		if err := rows.Scan(&a.ProductName, &a.TotalSold, &a.TotalSum); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		analytics = append(analytics, a)
+	}
 
-// 	"github.com/jackc/pgx/v5"
-// 	"go.uber.org/zap"
-// )
+	json.NewEncoder(w).Encode(analytics)
+}
 
-// // Product структура товара
-// type Product struct {
-// 	ID          int                    `json:"id"`
-// 	Name        string                 `json:"name"`
-// 	Description string                 `json:"description"`
-// 	Features    map[string]interface{} `json:"features"`
-// 	Weight      float64                `json:"weight"`
-// 	Barcode     string                 `json:"barcode"`
-// }
+func getTopWarehouses(w http.ResponseWriter, r *http.Request) {
+	rows, err := dbpool.Query(context.Background(), "SELECT w.id, w.address, SUM(a.total_amount) FROM analytics a JOIN warehouses w ON a.warehouse_id = w.id GROUP BY w.id ORDER BY SUM(a.total_amount) DESC LIMIT 10")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
 
-// var db *pgx.Conn
-// var logger *zap.Logger
+	var revenues []WarehouseRevenue
+	for rows.Next() {
+		var r WarehouseRevenue
+		if err := rows.Scan(&r.WarehouseID, &r.Address, &r.TotalRevenue); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		revenues = append(revenues, r)
+	}
 
-// func main() {
-// 	// Инициализация логгера (пример, лучше настроить)
-// 	logger, _ = zap.NewProduction()
-// 	defer logger.Sync()
+	json.NewEncoder(w).Encode(revenues)
+}
 
-// 	// Подключение к БД (замените на свои параметры)
-// 	conn, err := pgx.Connect(context.Background(), "postgres://postgres:root@localhost:5432/Unvent")
-// 	if err != nil {
-// 		logger.Fatal("Unable to connect to database", zap.Error(err))
-// 	}
-// 	defer conn.Close(context.Background())
-// 	db = conn
+// INVENTORY
+func createInventory(w http.ResponseWriter, r *http.Request) {
+	var inv Inventory
+	if err := json.NewDecoder(r.Body).Decode(&inv); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_, err := dbpool.Exec(context.Background(), "INSERT INTO inventory (productid, warehouseid, quantity, price, discount) VALUES ($1, $2, $3, $4, $5)", inv.ProductID, inv.WarehouseID, inv.Quantity, inv.Price, inv.Discount)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
 
-// 	http.HandleFunc("/products", getProductsHandler)
-// 	http.HandleFunc("/products/create", createProductHandler)
-// 	http.HandleFunc("/products/update", updateProductHandler) // Endpoint обновления
+func updateInventory(w http.ResponseWriter, r *http.Request) {
+	var inv Inventory
+	if err := json.NewDecoder(r.Body).Decode(&inv); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_, err := dbpool.Exec(context.Background(), "UPDATE inventory SET quantity = quantity + $1 WHERE id = $2", inv.Quantity, inv.ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
 
-// 	logger.Info("Starting server on :8080")
-// 	log.Fatal(http.ListenAndServe(":8080", nil))
-// }
+func createDiscount(w http.ResponseWriter, r *http.Request) {
+	var discount struct {
+		ProductIDs []int   `json:"product_ids"`
+		Discount   float64 `json:"discount"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&discount); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_, err := dbpool.Exec(context.Background(), "UPDATE inventory SET discount = $1 WHERE productid = ANY($2)", discount.Discount, discount.ProductIDs)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
 
-// func getProductsHandler(w http.ResponseWriter, r *http.Request) {
-// 	if r.Method != http.MethodGet {
-// 		http.Error(w, "Метод, который не разрешен", http.StatusMethodNotAllowed)
-// 		return
-// 	}
+func getInventoryByWarehouse(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	warehouseID := vars["warehouseID"]
+	rows, err := dbpool.Query(context.Background(), "SELECT id, productid, price, discount FROM inventory WHERE warehouseid = $1", warehouseID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
 
-// 	products, err := getProducts()
-// 	if err != nil {
-// 		http.Error(w, err.Error(), http.StatusInternalServerError)
-// 		return
-// 	}
+	var inventories []Inventory
+	for rows.Next() {
+		var inv Inventory
+		if err := rows.Scan(&inv.ID, &inv.ProductID, &inv.Price, &inv.Discount); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		inventories = append(inventories, inv)
+	}
+	json.NewEncoder(w).Encode(inventories)
+}
 
-// 	w.Header().Set("Content-Type", "application/json")
-// 	json.NewEncoder(w).Encode(products)
-// }
+func getInventoryItem(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+	var inv Inventory
+	err := dbpool.QueryRow(context.Background(), "SELECT id, productid, quantity, price, discount FROM inventory WHERE id = $1", id).Scan(&inv.ID, &inv.ProductID, &inv.Quantity, &inv.Price, &inv.Discount)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	json.NewEncoder(w).Encode(inv)
+}
 
-// func createProductHandler(w http.ResponseWriter, r *http.Request) {
-// 	if r.Method != http.MethodPost {
-// 		http.Error(w, "Метод, который не разрешен", http.StatusMethodNotAllowed)
-// 		return
-// 	}
+func getInventorySummary(w http.ResponseWriter, r *http.Request) {
+	var summary struct {
+		WarehouseID int             `json:"warehouseid"`
+		Items       []InventoryItem `json:"items"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&summary); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-// 	var product Product
-// 	err := json.NewDecoder(r.Body).Decode(&product)
-// 	if err != nil {
-// 		http.Error(w, err.Error(), http.StatusBadRequest)
-// 		return
-// 	}
+	var total float64
+	for _, item := range summary.Items {
+		var price float64
+		err := dbpool.QueryRow(context.Background(), "SELECT price FROM inventory WHERE warehouseid = $1 AND product_id = $2", summary.WarehouseID, item.ProductID).Scan(&price)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		total += price * float64(item.Quantity)
+	}
+	json.NewEncoder(w).Encode(map[string]float64{"total": total})
+}
 
-// 	id, err := createProduct(product)
-// 	if err != nil {
-// 		http.Error(w, err.Error(), http.StatusInternalServerError)
-// 		return
-// 	}
+func purchaseItems(w http.ResponseWriter, r *http.Request) {
+	var purchase struct {
+		WarehouseID int             `json:"warehouseid"`
+		Items       []InventoryItem `json:"items"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&purchase); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-// 	w.WriteHeader(http.StatusCreated)
-// 	fmt.Fprintf(w, "Product created with ID: %d", id)
-// }
+	for _, item := range purchase.Items {
+		var quantity int
+		err := dbpool.QueryRow(context.Background(), "SELECT quantity FROM inventory WHERE warehouseid = $1 AND productid = $2", purchase.WarehouseID, item.ProductID).Scan(&quantity)
+		if err != nil || quantity < item.Quantity {
+			http.Error(w, "Insufficient quantity", http.StatusBadRequest)
+			return
+		}
+		_, err = dbpool.Exec(context.Background(), "UPDATE inventory SET quantity = quantity - $1 WHERE warehouseid = $2 AND productid = $3", item.Quantity, purchase.WarehouseID, item.ProductID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+}
 
-// func updateProductHandler(w http.ResponseWriter, r *http.Request) {
-// 	if r.Method != http.MethodPut {
-// 		http.Error(w, "Метод, который не разрешен", http.StatusMethodNotAllowed)
-// 		return
-// 	}
-
-// 	productIDStr := r.URL.Query().Get("id")
-// 	if productIDStr == "" {
-// 		http.Error(w, "Missing product ID", http.StatusBadRequest)
-// 		return
-// 	}
-
-// 	productID, err := strconv.Atoi(productIDStr)
-// 	if err != nil {
-// 		http.Error(w, "Invalid product ID", http.StatusBadRequest)
-// 		return
-// 	}
-
-// 	var product Product
-// 	err = json.NewDecoder(r.Body).Decode(&product)
-// 	if err != nil {
-// 		http.Error(w, err.Error(), http.StatusBadRequest)
-// 		return
-// 	}
-// 	product.ID = productID
-
-// 	err = updateProduct(product)
-// 	if err != nil {
-// 		http.Error(w, err.Error(), http.StatusInternalServerError)
-// 		return
-// 	}
-
-// 	w.WriteHeader(http.StatusOK)
-// 	fmt.Fprint(w, "Product updated successfully")
-// }
-
-// // getProducts возвращает список товаров из БД
-// func getProducts() ([]Product, error) {
-// 	rows, err := db.Query(context.Background(), "SELECT id, name, description, features, weight, barcode FROM products")
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to query products: %w", err)
-// 	}
-// 	defer rows.Close()
-
-// 	var products []Product
-// 	for rows.Next() {
-// 		var p Product
-// 		var featuresJSON []byte
-// 		err := rows.Scan(&p.ID, &p.Name, &p.Description, &featuresJSON, &p.Weight, &p.Barcode)
-// 		if err != nil {
-// 			return nil, fmt.Errorf("failed to scan product: %w", err)
-// 		}
-// 		// unmarshal featuresJSON to p.Features
-// 		err = json.Unmarshal(featuresJSON, &p.Features)
-// 		if err != nil {
-// 			return nil, fmt.Errorf("failed to unmarshal features: %w", err)
-// 		}
-
-// 		products = append(products, p)
-// 	}
-
-// 	return products, nil
-// }
-
-// // createProduct создает новый товар в БД
-// func createProduct(p Product) (int, error) {
-// 	featuresJSON, err := json.Marshal(p.Features)
-// 	if err != nil {
-// 		return 0, fmt.Errorf("failed to marshal features: %w", err)
-// 	}
-// 	var id int
-// 	err = db.QueryRow(context.Background(), "INSERT INTO products (name, description, features, weight, barcode) VALUES ($1, $2, $3, $4, $5) RETURNING id", p.Name, p.Description, featuresJSON, p.Weight, p.Barcode).Scan(&id)
-
-// 	if err != nil {
-// 		return 0, fmt.Errorf("failed to insert product: %w", err)
-// 	}
-
-// 	return id, nil
-// }
-
-// // updateProduct обновляет существующий товар в БД
-// func updateProduct(p Product) error {
-// 	featuresJSON, err := json.Marshal(p.Features)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to marshal features: %w", err)
-// 	}
-
-// 	_, err = db.Exec(context.Background(), `
-//         UPDATE products
-//         SET description = $1, features = $2
-//         WHERE id = $3
-//     `, p.Description, featuresJSON, p.ID)
-
-// 	if err != nil {
-// 		return fmt.Errorf("failed to update product: %w", err)
-// 	}
-
-// 	return nil
-// }
+type InventoryItem struct {
+	ProductID int `json:"productid"`
+	Quantity  int `json:"quantity"`
+}
